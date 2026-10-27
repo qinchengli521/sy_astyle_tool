@@ -1,15 +1,16 @@
 # -*- coding: utf-8 -*-
-"""Astyle 批量格式化工具 —— 入口与业务逻辑。
+"""Astyle 批量格式化工具 —— 入口与业务逻辑（tkinter 版，纯标准库）。
 
 与 Source Insight 脚本等价：
     "D:\\astyle\\astyle.exe" --options="D:\\astyle\\.astylerc" 目标文件
 本程序逐文件调用 astyle，风格完全来自 .astylerc，不额外施加任何风格参数。
 
 分层约定：
-- 界面在 main_window.ui → ui_main_window.py → ui_main.py（只做展示，不连信号）。
-- **全部信号槽连接都在本文件的 AppController 里**，包括浏览按钮、清空日志、
-  打开日志目录、历史目录菜单等界面内动作。
-- 本文件只通过 MainWindow 的公开方法/属性操作界面，不直接改控件状态。
+- 界面在 ui_main.py：只搭界面、暴露界面原语，不绑定业务命令。
+- **全部命令/事件绑定都在本文件的 AppController 里**（tkinter 的 `command=`、
+  `protocol()`、菜单项）。
+- 后台执行用 threading.Thread + queue.Queue：tk 控件只能在主线程操作，
+  工作线程只往队列里放事件，主线程用 `after()` 轮询后刷新界面。
 """
 
 from __future__ import annotations
@@ -17,44 +18,24 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import queue
 import shutil
 import subprocess
-import sys
 import tempfile
+import threading
 import time
-import warnings
+import tkinter as tk
+import tkinter.font as tkfont
 from datetime import datetime
 from pathlib import Path
+from tkinter import ttk
 from typing import List, Optional, Tuple
 
-# PyQt6 6.4.x 的 sip 在"用 Python 继承 Qt 类"（QMainWindow / QThread 子类）实例化时
-# 仍会发出 "sipPyTypeDict() is deprecated ... " 的 DeprecationWarning：
-# 是 sip 扩展自身的问题，与本程序无关，也无法通过改代码消除
-# （PyQt6 ≥ 6.5 已修复）。这里定向屏蔽，避免污染控制台输出。
-# 注意：警告在实例化时才发出，但为保险起见仍在导入 PyQt6 之前设置。
-warnings.filterwarnings(
-    "ignore",
-    message=r"sipPyTypeDict\(\) is deprecated.*",
-    category=DeprecationWarning,
-)
-
-from PyQt6.QtCore import Qt, QThread, pyqtSignal  # noqa: E402
-from PyQt6.QtGui import QFont  # noqa: E402
-from PyQt6.QtWidgets import (  # noqa: E402
-    QApplication,
-    QDialog,
-    QHBoxLayout,
-    QLabel,
-    QMenu,
-    QPlainTextEdit,
-    QPushButton,
-    QVBoxLayout,
-)
-
-from ui_main import LOG_DIR, MainWindow, read_text_any  # noqa: E402
+from ui_main import LOG_DIR, MainWindow, read_text_any
 
 TIMEOUT = 60  # 单文件超时（秒）
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
+POLL_MS = 60  # 主线程轮询后台事件的间隔（毫秒）
 
 HISTORY_KEY = "history"     # 历史代码目录，存 settings.ini，JSON 数组，最近的在前
 HISTORY_LIMIT = 10          # 最多保留条数
@@ -225,18 +206,32 @@ def validate_config(cfg: dict) -> Optional[str]:
 
 
 # ---------------------------------------------------------------- 后台任务
-class FormatWorker(QThread):
-    log_signal = pyqtSignal(str, str)      # (整行文本, 级别)
-    progress_signal = pyqtSignal(int, int)  # (已完成, 总数)
-    done_signal = pyqtSignal(dict)          # 统计结果
+class FormatWorker:
+    """在工作线程里逐文件调用 astyle。
 
-    def __init__(self, job: dict, parent=None):
-        super().__init__(parent)
+    工作线程不碰任何 tk 控件，只往 events 队列投递：
+        ("log", 整行文本, 级别) / ("progress", 已完成, 总数) / ("done", 统计 dict)
+    """
+
+    def __init__(self, job: dict, events: "queue.Queue"):
         self.job = job
-        self._stop = False
+        self.events = events
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self.run, name="astyle-format", daemon=True
+        )
+
+    def start(self):
+        self._thread.start()
 
     def request_stop(self):
-        self._stop = True
+        self._stop.set()
+
+    def is_running(self) -> bool:
+        return self._thread.is_alive()
+
+    def join(self, timeout: Optional[float] = None):
+        self._thread.join(timeout)
 
     def run(self):
         files: List[Path] = self.job["files"]
@@ -259,7 +254,7 @@ class FormatWorker(QThread):
 
         try:
             for index, path in enumerate(files, 1):
-                if self._stop:
+                if self._stop.is_set():
                     stat["stopped"] = True
                     break
 
@@ -278,14 +273,14 @@ class FormatWorker(QThread):
                     stat["skip"] += 1
 
                 line = f"[{now_ts()}] [{status:<4}] {rel_path(path, root)}  {message}  {cost:.2f}s"
-                self.log_signal.emit(line, status)
-                self.progress_signal.emit(index, total)
+                self.events.put(("log", line, status))
+                self.events.put(("progress", index, total))
         finally:
             if tmpdir:
                 shutil.rmtree(tmpdir, ignore_errors=True)
 
         stat["elapsed"] = time.perf_counter() - started
-        self.done_signal.emit(stat)
+        self.events.put(("done", stat))
 
     # 实际格式化
     def _process_one(self, exe: str, rc: str, path: Path) -> Tuple[str, str]:
@@ -371,36 +366,36 @@ class AppController:
         self.logger: Optional[LogFile] = None
         self.pending_close = False
         self.job: dict = {}
+        self.events: "queue.Queue" = queue.Queue()
+        self.history_menu = tk.Menu(window, tearoff=0)
 
         self._connect_signals()
+        self.refresh_history_menu()
 
-    # -------- 所有信号槽集中在这里（ui_main.py 不含任何 connect）
+    # -------- 所有命令/事件绑定集中在这里（ui_main.py 不作任何绑定）
     def _connect_signals(self):
         w = self.window
 
         # 路径选择
-        w.btn_exe.clicked.connect(self.on_pick_exe)
-        w.btn_rc.clicked.connect(self.on_pick_rc)
-        w.btn_rc_view.clicked.connect(self.on_view_rc)
-        w.btn_dir.clicked.connect(self.on_pick_code_dir)
-        w.btn_add_exclude.clicked.connect(self.on_add_exclude)
+        w.btn_exe.configure(command=self.on_pick_exe)
+        w.btn_rc.configure(command=self.on_pick_rc)
+        w.btn_rc_view.configure(command=self.on_view_rc)
+        w.btn_dir.configure(command=self.on_pick_code_dir)
+        w.btn_history.configure(command=self.on_show_history)
+        w.btn_add_exclude.configure(command=self.on_add_exclude)
 
         # 日志与工具
-        w.btn_clear.clicked.connect(w.clear_log)
-        w.btn_open_log.clicked.connect(w.open_log_dir)
+        w.btn_clear.configure(command=w.clear_log)
+        w.btn_open_log.configure(command=w.open_log_dir)
 
         # 主流程
-        w.btn_check.clicked.connect(self.on_check)
-        w.btn_start.clicked.connect(self.on_start)
-        w.btn_stop.clicked.connect(self.on_stop)
-        w.btn_clean_orig.clicked.connect(self.on_clean_orig)
-        w.close_requested.connect(self.on_close_requested)
+        w.btn_check.configure(command=self.on_check)
+        w.btn_start.configure(command=self.on_start)
+        w.btn_stop.configure(command=self.on_stop)
+        w.btn_clean_orig.configure(command=self.on_clean_orig)
 
-        # 历史目录：QToolButton + InstantPopup，点一下弹菜单，弹出前重建内容
-        self.history_menu = QMenu(w)
-        self.history_menu.aboutToShow.connect(self.refresh_history_menu)
-        w.btn_history.setMenu(self.history_menu)
-        self.refresh_history_menu()
+        # 关窗按钮
+        w.protocol("WM_DELETE_WINDOW", self.on_close_requested)
 
     # -------- 浏览按钮
     def on_pick_exe(self):
@@ -426,27 +421,44 @@ class AppController:
         self._show_text_dialog(f"风格配置（只读） - {p.name}", str(p), text)
 
     def _show_text_dialog(self, title: str, subtitle: str, text: str):
-        """只读文本对话框（查看 .astylerc 用），由业务层构造并连接其按钮。"""
-        dlg = QDialog(self.window)
-        dlg.setWindowTitle(title)
-        dlg.resize(760, 640)
-        lay = QVBoxLayout(dlg)
-        hint = QLabel(subtitle)
-        hint.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        edit = QPlainTextEdit()
-        edit.setReadOnly(True)
-        edit.setPlainText(text)
-        edit.setFont(QFont("Consolas", 10))
-        edit.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
-        lay.addWidget(hint)
-        lay.addWidget(edit, 1)
-        row = QHBoxLayout()
-        row.addStretch(1)
-        btn = QPushButton("关闭")
-        btn.clicked.connect(dlg.accept)
-        row.addWidget(btn)
-        lay.addLayout(row)
-        dlg.exec()
+        """只读文本对话框（查看 .astylerc 用），由业务层构造并接管其按钮。"""
+        dlg = tk.Toplevel(self.window)
+        dlg.title(title)
+        dlg.geometry("760x640")
+        dlg.transient(self.window)
+
+        frame = ttk.Frame(dlg, padding=(10, 8))
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text=subtitle, anchor="w").pack(fill="x", pady=(0, 6))
+
+        body = ttk.Frame(frame)
+        body.pack(fill="both", expand=True)
+        body.rowconfigure(0, weight=1)
+        body.columnconfigure(0, weight=1)
+
+        edit = tk.Text(
+            body,
+            wrap="none",
+            font=tkfont.Font(family="Consolas", size=10),
+            bd=1,
+            relief="solid",
+            highlightthickness=0,
+        )
+        vbar = ttk.Scrollbar(body, orient="vertical", command=edit.yview)
+        hbar = ttk.Scrollbar(body, orient="horizontal", command=edit.xview)
+        edit.configure(yscrollcommand=vbar.set, xscrollcommand=hbar.set)
+        edit.grid(row=0, column=0, sticky="nsew")
+        vbar.grid(row=0, column=1, sticky="ns")
+        hbar.grid(row=1, column=0, sticky="ew")
+        edit.insert("1.0", text)
+        edit.configure(state="disabled")
+
+        row = ttk.Frame(frame)
+        row.pack(fill="x", pady=(8, 0))
+        ttk.Button(row, text="关闭", command=dlg.destroy).pack(side="right")
+
+        dlg.grab_set()
+        self.window.wait_window(dlg)
 
     def on_pick_code_dir(self):
         path = self.window.pick_code_dir()
@@ -461,19 +473,26 @@ class AppController:
 
     # -------- 历史目录（数据落在 settings.ini 的 history 键，JSON 数组）
     def history(self) -> List[str]:
-        raw = self.window.settings.value(HISTORY_KEY, "", type=str)
+        raw = self.window.settings.get(HISTORY_KEY, "")
         if not raw:
             return []
-        try:
-            items = json.loads(raw)
-        except (TypeError, ValueError):
-            return []
-        if not isinstance(items, list):
-            return []
-        return [p for p in items if isinstance(p, str) and p]
+        # 正常情况是 JSON；旧版 QSettings 可能留下转义过的引号/反斜杠，按序尝试清理
+        candidates = [
+            raw,
+            raw.replace("\\\\", "\\"),
+            raw.replace("\\\\", "\\").replace('\\"', '"'),
+        ]
+        for candidate in candidates:
+            try:
+                items = json.loads(candidate)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(items, list):
+                return [p for p in items if isinstance(p, str) and p]
+        return []
 
     def save_history(self, items: List[str]):
-        self.window.settings.setValue(
+        self.window.settings.set(
             HISTORY_KEY, json.dumps(items[:HISTORY_LIMIT], ensure_ascii=False)
         )
         self.window.settings.sync()
@@ -495,19 +514,29 @@ class AppController:
 
     def refresh_history_menu(self):
         menu = self.history_menu
-        menu.clear()
+        menu.delete(0, "end")
         entries = [p for p in self.history() if Path(p).is_dir()]
         if not entries:
-            menu.addAction("（暂无历史目录，先浏览一次目录）").setEnabled(False)
+            menu.add_command(label="（暂无历史目录，先浏览一次目录）", state="disabled")
             return
         for path in entries:
-            action = menu.addAction(f"{Path(path).name}    {path}")
-            action.setToolTip(path)
-            action.triggered.connect(
-                lambda _checked=False, target=path: self.on_history_chosen(target)
+            menu.add_command(
+                label=f"{Path(path).name}    {path}",
+                command=lambda target=path: self.on_history_chosen(target),
             )
-        menu.addSeparator()
-        menu.addAction("清除历史记录").triggered.connect(self.on_clear_history)
+        menu.add_separator()
+        menu.add_command(label="清除历史记录", command=self.on_clear_history)
+
+    def on_show_history(self):
+        """点"历史"按钮时，在按钮下方弹出历史目录菜单。"""
+        self.refresh_history_menu()
+        btn = self.window.btn_history
+        x = btn.winfo_rootx()
+        y = btn.winfo_rooty() + btn.winfo_height()
+        try:
+            self.history_menu.tk_popup(x, y)
+        finally:
+            self.history_menu.grab_release()
 
     def on_history_chosen(self, path: str):
         self.window.set_code_dir(path)
@@ -528,6 +557,28 @@ class AppController:
         if self.logger:
             self.logger.close()
             self.logger = None
+
+    # -------- 后台事件轮询（tk 只能在主线程改控件）
+    def _pump(self):
+        try:
+            while True:
+                event = self.events.get_nowait()
+                kind = event[0]
+                if kind == "log":
+                    self._log(event[1], event[2])
+                elif kind == "progress":
+                    self.window.set_progress(event[1], event[2])
+                elif kind == "done":
+                    self.on_done(event[1])
+                    return
+        except queue.Empty:
+            pass
+
+        if self.worker and self.worker.is_running():
+            try:
+                self.window.after(POLL_MS, self._pump)
+            except tk.TclError:
+                pass
 
     # -------- 检测 astyle 可执行性
     def on_check(self):
@@ -561,7 +612,7 @@ class AppController:
 
     # -------- 清理代码目录下的 .orig 备份
     def on_clean_orig(self):
-        if self.worker and self.worker.isRunning():
+        if self.worker and self.worker.is_running():
             return
 
         cfg = self.window.get_config()
@@ -614,7 +665,7 @@ class AppController:
 
     # -------- 开始
     def on_start(self):
-        if self.worker and self.worker.isRunning():
+        if self.worker and self.worker.is_running():
             return
 
         cfg = self.window.get_config()
@@ -665,33 +716,45 @@ class AppController:
         job["files"] = files
         job["root"] = root
 
-        worker = FormatWorker(job)
-        worker.log_signal.connect(lambda line, level: self._log(line, level))
-        worker.progress_signal.connect(self.window.set_progress)
-        worker.done_signal.connect(self.on_done)
-        self.worker = worker
-
+        self.worker = FormatWorker(job, self.events)
         self.window.set_progress(0, len(files))
         self.window.set_running(True)
-        worker.start()
+        self.worker.start()
+        self.window.after(POLL_MS, self._pump)
 
     # -------- 停止
     def on_stop(self):
-        if self.worker and self.worker.isRunning():
+        if self.worker and self.worker.is_running():
             self.worker.request_stop()
             self._log(f"[{now_ts()}] [INFO] 已请求停止，将在当前文件处理完成后中止", "INFO")
 
     # -------- 关闭窗口
     def on_close_requested(self):
-        self.pending_close = True
-        self.on_stop()
+        if self.worker and self.worker.is_running():
+            if not self.window.ask_confirm("正在处理", "文件正在处理中，确定中止并退出吗？"):
+                return
+            self.pending_close = True
+            self.on_stop()
+            return
+        self._shutdown()
+        self.window.destroy()
+
+    def _shutdown(self):
+        if self.worker and self.worker.is_running():
+            self.worker.request_stop()
+            self.worker.join(3.0)
+        self._close_logger()
+        try:
+            self.window.save_settings()
+        except tk.TclError:
+            pass
 
     # -------- 完成
     def on_done(self, stat: dict):
         worker = self.worker
         self.worker = None
         if worker:
-            worker.wait(3000)
+            worker.join(3.0)
 
         done = stat["ok"] + stat["skip"] + stat["fail"]
         self.window.set_progress(done, stat["total"])
@@ -714,7 +777,11 @@ class AppController:
 
         if self.pending_close:
             self.pending_close = False
-            self.window.close()
+            try:
+                self.window.save_settings()
+            except tk.TclError:
+                pass
+            self.window.destroy()
             return
 
         if stat["dry_run"]:
@@ -730,29 +797,17 @@ class AppController:
                 "处理完成",
                 f"有 {stat['fail']} 个文件处理失败，共处理 {stat['total']} 个文件。\n详见日志。",
                 "warning",
-                show_log_button=True,
             )
-
-    # -------- 退出保护
-    def shutdown(self):
-        if self.worker and self.worker.isRunning():
-            self.worker.request_stop()
-            self.worker.wait(3000)
-        self._close_logger()
 
 
 def main():
-    app = QApplication(sys.argv)
-    app.setApplicationName("AstyleTool")
-    app.setOrganizationName("my_astyle")
-
     window = MainWindow()
     window.load_settings()
     controller = AppController(window)
-    app.aboutToQuit.connect(controller.shutdown)
-
-    window.show()
-    sys.exit(app.exec())
+    try:
+        window.mainloop()
+    finally:
+        controller._shutdown()
 
 
 if __name__ == "__main__":
