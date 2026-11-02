@@ -20,10 +20,12 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import List
 
-DEFAULT_EXE = r"D:\astyle\astyle.exe"
-DEFAULT_RC = r"D:\astyle\.astylerc"
-LOG_DIR = Path(__file__).resolve().parent / "logs"
-SETTINGS_FILE = Path(__file__).resolve().parent / "settings.ini"
+APP_DIR = Path(__file__).resolve().parent
+# 首次运行（没有 settings.ini）时使用随程序分发的 astyle 与风格配置
+DEFAULT_EXE = str(APP_DIR / "astyle" / "astyle.exe")
+DEFAULT_RC = str(APP_DIR / ".astylerc")
+LOG_DIR = APP_DIR / "logs"
+SETTINGS_FILE = APP_DIR / "settings.ini"
 
 LOG_COLORS = {
     "OK": "#1a7f37",
@@ -196,19 +198,19 @@ class MainWindow(tk.Tk):
             row=0, column=0, sticky="w", pady=2
         )
         self.exe_edit = PlaceholderEntry(
-            path, hint=r"astyle.exe 完整路径，例如 D:\astyle\astyle.exe"
+            path, hint="astyle.exe 完整路径（默认使用程序目录下的 astyle）"
         )
         self.exe_edit.grid(row=0, column=1, sticky="ew", pady=2)
         self.btn_exe = ttk.Button(path, text="浏览", width=6)
         self.btn_exe.grid(row=0, column=2, padx=(6, 3), pady=2)
-        self.btn_check = ttk.Button(path, text="检测", width=6)
+        self.btn_check = ttk.Button(path, text="刷新", width=6)
         self.btn_check.grid(row=0, column=3, pady=2)
 
         ttk.Label(path, text="风格配置", width=11, anchor="w").grid(
             row=1, column=0, sticky="w", pady=2
         )
         self.rc_edit = PlaceholderEntry(
-            path, hint=r"风格配置文件路径，例如 D:\astyle\.astylerc"
+            path, hint="风格配置文件路径（默认使用程序目录下的 .astylerc）"
         )
         self.rc_edit.grid(row=1, column=1, sticky="ew", pady=2)
         self.btn_rc = ttk.Button(path, text="浏览", width=6)
@@ -233,29 +235,33 @@ class MainWindow(tk.Tk):
         opt.grid(row=1, column=0, sticky="ew", padx=10, pady=4)
         opt.columnconfigure(1, weight=1)
 
+        # 复选框放进独立子框，避免其文字宽度撑开下面的输入框列
+        checks = ttk.Frame(opt)
+        checks.grid(row=0, column=0, columnspan=4, sticky="w")
+
         self.recursive_var = tk.BooleanVar(value=True)
         self.chk_recursive = ttk.Checkbutton(
-            opt, text="递归子目录", variable=self.recursive_var
+            checks, text="递归子目录", variable=self.recursive_var
         )
-        self.chk_recursive.grid(row=0, column=0, sticky="w", pady=2)
+        self.chk_recursive.pack(side="left", pady=2)
 
-        self.backup_var = tk.BooleanVar(value=True)
+        self.backup_var = tk.BooleanVar(value=False)
         self.chk_backup = ttk.Checkbutton(
-            opt, text="保留 .orig 备份", variable=self.backup_var
+            checks, text="保留 .orig 备份", variable=self.backup_var
         )
-        self.chk_backup.grid(row=0, column=1, sticky="w", padx=(14, 0), pady=2)
+        self.chk_backup.pack(side="left", padx=(14, 0), pady=2)
 
         self.dryrun_var = tk.BooleanVar(value=False)
         self.chk_dryrun = ttk.Checkbutton(
-            opt, text="预览模式（不改文件）", variable=self.dryrun_var
+            checks, text="预览模式（不改文件）", variable=self.dryrun_var
         )
-        self.chk_dryrun.grid(row=0, column=2, sticky="w", padx=(14, 0), pady=2)
+        self.chk_dryrun.pack(side="left", padx=(14, 0), pady=2)
 
         ttk.Label(opt, text="文件类型", width=11, anchor="w").grid(
             row=1, column=0, sticky="w", pady=2
         )
         ext_row = ttk.Frame(opt)
-        ext_row.grid(row=1, column=1, columnspan=2, sticky="w")
+        ext_row.grid(row=1, column=1, columnspan=3, sticky="w")
         self.ext_vars: dict[str, tk.BooleanVar] = {}
         self.ext_boxes: dict[str, ttk.Checkbutton] = {}
         for index, ext in enumerate(ALL_EXTS):
@@ -273,7 +279,7 @@ class MainWindow(tk.Tk):
         )
         self.exclude_edit.grid(row=2, column=1, sticky="ew", pady=2)
         self.btn_add_exclude = ttk.Button(opt, text="添加", width=6)
-        self.btn_add_exclude.grid(row=2, column=2, padx=(6, 0), pady=2)
+        self.btn_add_exclude.grid(row=2, column=2, padx=(6, 3), pady=2)
 
         # --- 操作 ---
         act = ttk.LabelFrame(self, text="操作", padding=(8, 6))
@@ -327,6 +333,10 @@ class MainWindow(tk.Tk):
         self.status_label = ttk.Label(self, text="就绪", anchor="w", padding=(10, 3))
         self.status_label.grid(row=5, column=0, sticky="ew")
 
+        # 排除目录行与上方路径行共用列宽：为“刷新”按钮所在列预留同宽空间
+        self.update_idletasks()
+        opt.columnconfigure(3, minsize=self.btn_check.winfo_reqwidth())
+
     # ------------------------------------------------- 界面原语：读取/设置输入
     def exe_path(self) -> str:
         return self.exe_edit.get_text().strip().strip('"')
@@ -336,6 +346,12 @@ class MainWindow(tk.Tk):
 
     def code_dir(self) -> str:
         return self.dir_edit.get_text().strip().strip('"')
+
+    def set_exe_path(self, path: str):
+        self.exe_edit.set_text(path)
+
+    def set_rc_path(self, path: str):
+        self.rc_edit.set_text(path)
 
     def set_code_dir(self, path: str):
         self.dir_edit.set_text(path)
@@ -439,8 +455,6 @@ class MainWindow(tk.Tk):
         self.btn_stop.configure(state="normal" if running else "disabled")
         if running:
             self.set_status("处理中…")
-        else:
-            self.progress.configure(value=0)
 
     def set_status(self, text: str):
         self.status_label.configure(text=text)
@@ -493,7 +507,7 @@ class MainWindow(tk.Tk):
         self.rc_edit.set_text(s.get_path("rc", DEFAULT_RC))
         self.dir_edit.set_text(s.get_path("root", ""))
         self.recursive_var.set(s.get_bool("recursive", True))
-        self.backup_var.set(s.get_bool("backup", True))
+        self.backup_var.set(s.get_bool("backup", False))
         self.dryrun_var.set(s.get_bool("dry_run", False))
 
         exts = s.get("exts", ",".join(DEFAULT_EXTS))

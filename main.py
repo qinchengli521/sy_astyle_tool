@@ -1,8 +1,6 @@
 # -*- coding: utf-8 -*-
 """Astyle 批量格式化工具 —— 入口与业务逻辑（tkinter 版，纯标准库）。
 
-与 Source Insight 脚本等价：
-    "D:\\astyle\\astyle.exe" --options="D:\\astyle\\.astylerc" 目标文件
 本程序逐文件调用 astyle，风格完全来自 .astylerc，不额外施加任何风格参数。
 
 分层约定：
@@ -31,7 +29,7 @@ from pathlib import Path
 from tkinter import ttk
 from typing import List, Optional, Tuple
 
-from ui_main import LOG_DIR, MainWindow, read_text_any
+from ui_main import DEFAULT_EXE, DEFAULT_RC, LOG_DIR, MainWindow, read_text_any
 
 TIMEOUT = 60  # 单文件超时（秒）
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
@@ -115,13 +113,19 @@ def backup_file(path: Path) -> Tuple[str, str]:
 
 
 # ---------------------------------------------------------------- 文件扫描
-def _is_excluded_path(path: Path, excludes: List[Path]) -> bool:
+def _normalize_path(path: Path) -> str:
+    """统一为绝对路径并规范化大小写/分隔符，保证排除路径比较可靠。"""
     try:
-        target = str(path.resolve()).lower()
-    except OSError:
-        target = str(path).lower()
+        resolved = path.resolve()
+    except (OSError, RuntimeError):
+        resolved = Path(os.path.abspath(str(path)))
+    return os.path.normcase(str(resolved))
+
+
+def _is_excluded_path(path: Path, excludes: List[Path]) -> bool:
+    target = _normalize_path(path)
     for item in excludes:
-        base = str(item).lower()
+        base = _normalize_path(item)
         if target == base or target.startswith(base + os.sep):
             return True
     return False
@@ -165,8 +169,12 @@ def scan_files(
                     files.append(full)
     else:
         for entry in root.iterdir():
-            if entry.is_file() and entry.suffix.lower() in exts:
-                files.append(entry)
+            if not entry.is_file() or entry.suffix.lower() not in exts:
+                continue
+            # 非递归虽不会进入子目录，仍按同一套路径规则过滤文件
+            if paths and _is_excluded_path(entry, paths):
+                continue
+            files.append(entry)
 
     files.sort(key=lambda p: str(p).lower())
     return files, excluded_dirs
@@ -187,6 +195,8 @@ def validate_config(cfg: dict) -> Optional[str]:
     exe = Path(cfg["exe"])
     if not exe.is_file():
         return f"astyle 程序不存在：\n{exe}"
+    if exe.suffix.lower() != ".exe":
+        return f"astyle 程序必须是 .exe 文件：\n{exe}"
 
     if not cfg["rc"]:
         return "请先指定 .astylerc 风格配置文件的路径。"
@@ -339,13 +349,25 @@ class FormatWorker:
 
 
 class LogFile:
-    """追加写入 logs/astyle_YYYYMMDD_HHMMSS.log（UTF-8 带 BOM，记事本可读）。"""
+    """写入 logs/astyle_YYYYMMDD_HHMMSS.log（UTF-8 带 BOM，记事本可读）。
+
+    同一秒内重复开始时依次使用 _2、_3 后缀，避免覆盖上一次日志。
+    """
 
     def __init__(self):
         LOG_DIR.mkdir(parents=True, exist_ok=True)
-        name = datetime.now().strftime("astyle_%Y%m%d_%H%M%S.log")
-        self.path = LOG_DIR / name
-        self._fh = open(self.path, "w", encoding="utf-8-sig", newline="\n")
+        base = datetime.now().strftime("astyle_%Y%m%d_%H%M%S")
+        index = 1
+        while True:
+            name = f"{base}.log" if index == 1 else f"{base}_{index}.log"
+            path = LOG_DIR / name
+            try:
+                self._fh = open(path, "x", encoding="utf-8-sig", newline="\n")
+            except FileExistsError:
+                index += 1
+                continue
+            self.path = path
+            break
 
     def write(self, line: str):
         if self._fh:
@@ -580,8 +602,10 @@ class AppController:
             except tk.TclError:
                 pass
 
-    # -------- 检测 astyle 可执行性
+    # -------- 刷新路径并检测 astyle 可执行性
     def on_check(self):
+        self.window.set_exe_path(DEFAULT_EXE)
+        self.window.set_rc_path(DEFAULT_RC)
         exe = self.window.exe_path()
         if not exe:
             self.window.notify("检测 astyle", "请先填写 astyle.exe 的路径。", "warning")
