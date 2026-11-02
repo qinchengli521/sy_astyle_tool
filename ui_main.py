@@ -44,7 +44,7 @@ HINT_COLOR = "#8a8f98"
 ALL_EXTS = [".c", ".h", ".cpp", ".hpp"]
 DEFAULT_EXTS = [".c", ".h"]
 
-WINDOW_TITLE = "思远Astyle代码风格化工具"
+WINDOW_TITLE = "思远Astyle代码风格化工具 V0.1"
 WINDOW_GEOMETRY = "610x620"
 MIN_WIDTH, MIN_HEIGHT = 610, 620
 

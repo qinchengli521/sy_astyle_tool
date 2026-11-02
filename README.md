@@ -66,7 +66,7 @@ python main.py
 
 也可以使用打包好的免安装版本（无需 Python 环境），打包方法见 [docs/打包说明.md](docs/打包说明.md)。
 
-启动后窗口标题为 `思远Astyle代码风格化工具`，三个路径框默认值为：
+启动后窗口标题为 `思远Astyle代码风格化工具 V0.1`，三个路径框默认值为：
 
 - Astyle 程序：`<程序目录>\astyle\astyle.exe`
 - 风格配置：`<程序目录>\.astylerc`
