@@ -38,7 +38,7 @@ HINT_COLOR = "#8a8f98"
 ALL_EXTS = [".c", ".h", ".cpp", ".hpp"]
 DEFAULT_EXTS = [".c", ".h"]
 
-WINDOW_TITLE = "思远Astyle代码风格化工具 V0.1"
+WINDOW_TITLE = "思远Astyle代码风格化工具"
 WINDOW_GEOMETRY = "610x620"
 MIN_WIDTH, MIN_HEIGHT = 610, 620
 
@@ -50,6 +50,9 @@ EXT_VARS = {
 }
 
 GEOMETRY_RE = re.compile(r"^(\d+)x(\d+)\+(-?\d+)\+(-?\d+)$")
+
+MAX_LOG_LINES = 5000   # 界面日志区最大行数，超出后从头部批量裁剪
+LOG_TRIM_CHUNK = 500   # 每次裁剪的行数，避免逐行频繁删除
 
 
 class Settings:
@@ -275,7 +278,7 @@ class MainWindow(tk.Tk):
             row=2, column=0, sticky="w", pady=2
         )
         self.exclude_edit = PlaceholderEntry(
-            opt, hint="排除的目录，多个用 ; 分隔，例如 build;output;third_party"
+            opt, hint="排除的目录，多个用 ; 分隔，例如 build;output;third_party（默认已排除 .git）"
         )
         self.exclude_edit.grid(row=2, column=1, sticky="ew", pady=2)
         self.btn_add_exclude = ttk.Button(opt, text="添加", width=6)
@@ -434,6 +437,10 @@ class MainWindow(tk.Tk):
         tag = level if level in LOG_COLORS else "INFO"
         self.log_edit.configure(state="normal")
         self.log_edit.insert("end", text + "\n", tag)
+        # 行数超限时从头部批量裁剪，避免大批量任务下 Text 越来越卡
+        lines = int(self.log_edit.index("end-1c").split(".")[0])
+        if lines > MAX_LOG_LINES:
+            self.log_edit.delete("1.0", f"{lines - MAX_LOG_LINES + LOG_TRIM_CHUNK}.0")
         self.log_edit.see("end")
         self.log_edit.configure(state="disabled")
 
@@ -468,8 +475,8 @@ class MainWindow(tk.Tk):
         )
 
     # ------------------------------------------------- 界面原语：弹窗
-    def notify(self, title: str, text: str, level: str = "info", show_log_button: bool = False):
-        """系统消息框（show_log_button 仅为兼容旧调用，tk 版不提供额外按钮）。"""
+    def notify(self, title: str, text: str, level: str = "info"):
+        """系统消息框。"""
         show = {
             "info": messagebox.showinfo,
             "warning": messagebox.showwarning,
@@ -515,8 +522,13 @@ class MainWindow(tk.Tk):
         for ext, var in self.ext_vars.items():
             var.set(ext in chosen)
 
-        self.exclude_edit.set_text(s.get_path("excludes", ""))
+        self.exclude_edit.set_text(s.get_path("excludes", ".git"))
 
         geometry = s.get("geometry", "")
-        if GEOMETRY_RE.match(geometry):
-            self.geometry(geometry)
+        match = GEOMETRY_RE.match(geometry)
+        if match:
+            width, height, x, y = (int(v) for v in match.groups())
+            # 防止换分辨率/拔掉显示器后窗口整体落在屏幕外
+            x = min(max(x, 100 - width), self.winfo_screenwidth() - 100)
+            y = min(max(y, 0), self.winfo_screenheight() - 100)
+            self.geometry(f"{width}x{height}+{x}+{y}")

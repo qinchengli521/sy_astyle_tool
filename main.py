@@ -98,6 +98,13 @@ def run_astyle(exe: str, rc: str, target: Path, timeout: int = TIMEOUT) -> Tuple
     return proc.returncode, output
 
 
+def fail_detail(code: int, output: str) -> str:
+    """失败说明。.astylerc 带 --quiet 时 astyle 往往没有任何输出，补充常见原因提示。"""
+    if output:
+        return f"退出码 {code}：{output}"
+    return f"退出码 {code}（无输出，可能是文件只读或被占用）"
+
+
 def orig_path(path: Path) -> Path:
     """<文件名>.orig 的路径。"""
     return path.with_name(path.name + ".orig")
@@ -269,10 +276,13 @@ class FormatWorker:
                     break
 
                 begin = time.perf_counter()
-                if dry:
-                    status, message = self._preview_one(exe, rc, path, tmpdir)
-                else:
-                    status, message = self._process_one(exe, rc, path)
+                try:
+                    if dry:
+                        status, message = self._preview_one(exe, rc, path, tmpdir)
+                    else:
+                        status, message = self._process_one(exe, rc, path)
+                except Exception as exc:  # 兜底：未预期异常按 FAIL 记录，不中断整批
+                    status, message = "FAIL", f"内部错误：{exc}"
                 cost = time.perf_counter() - begin
 
                 if status == "OK":
@@ -288,9 +298,9 @@ class FormatWorker:
         finally:
             if tmpdir:
                 shutil.rmtree(tmpdir, ignore_errors=True)
-
-        stat["elapsed"] = time.perf_counter() - started
-        self.events.put(("done", stat))
+            # 无论中途是否出错都必须投递 done，否则界面会永久停留在“处理中”
+            stat["elapsed"] = time.perf_counter() - started
+            self.events.put(("done", stat))
 
     # 实际格式化
     def _process_one(self, exe: str, rc: str, path: Path) -> Tuple[str, str]:
@@ -308,7 +318,7 @@ class FormatWorker:
 
         code, output = run_astyle(exe, rc, path)
         if code != 0:
-            return "FAIL", f"退出码 {code}" + (f"：{output}" if output else "")
+            return "FAIL", fail_detail(code, output)
 
         try:
             after = sha256_file(path)
@@ -336,7 +346,7 @@ class FormatWorker:
             before = sha256_file(tmp)
             code, output = run_astyle(exe, rc, tmp)
             if code != 0:
-                return "FAIL", f"退出码 {code}" + (f"：{output}" if output else "")
+                return "FAIL", fail_detail(code, output)
             after = sha256_file(tmp)
             return ("OK", "将会修改") if before != after else ("SKIP", "无需修改")
         except OSError as exc:
@@ -387,7 +397,6 @@ class AppController:
         self.worker: Optional[FormatWorker] = None
         self.logger: Optional[LogFile] = None
         self.pending_close = False
-        self.job: dict = {}
         self.events: "queue.Queue" = queue.Queue()
         self.history_menu = tk.Menu(window, tearoff=0)
 
@@ -604,9 +613,26 @@ class AppController:
 
     # -------- 刷新路径并检测 astyle 可执行性
     def on_check(self):
-        self.window.set_exe_path(DEFAULT_EXE)
-        self.window.set_rc_path(DEFAULT_RC)
-        exe = self.window.exe_path()
+        w = self.window
+        # 当前填写内容与默认路径不同时，先确认再覆盖，避免静默重置用户自定义路径
+        defaults = (
+            os.path.normcase(os.path.normpath(DEFAULT_EXE)),
+            os.path.normcase(os.path.normpath(DEFAULT_RC)),
+        )
+        currents = (
+            os.path.normcase(os.path.normpath(w.exe_path())),
+            os.path.normcase(os.path.normpath(w.rc_path())),
+        )
+        if any(cur and cur != dflt for cur, dflt in zip(currents, defaults)):
+            if not w.ask_confirm(
+                "刷新",
+                "将把“Astyle 程序”和“风格配置”重置为随程序附带的默认路径，\n"
+                "当前填写的内容会被覆盖。是否继续？",
+            ):
+                return
+        w.set_exe_path(DEFAULT_EXE)
+        w.set_rc_path(DEFAULT_RC)
+        exe = w.exe_path()
         if not exe:
             self.window.notify("检测 astyle", "请先填写 astyle.exe 的路径。", "warning")
             return
@@ -701,7 +727,13 @@ class AppController:
             return
 
         root = Path(cfg["root"])
-        files, excluded_dirs = scan_files(root, cfg["extensions"], cfg["recursive"], cfg["excludes"])
+        try:
+            files, excluded_dirs = scan_files(
+                root, cfg["extensions"], cfg["recursive"], cfg["excludes"]
+            )
+        except OSError as exc:
+            self.window.notify("扫描文件", f"扫描代码目录失败：\n{exc}", "warning")
+            return
 
         if not files:
             self.window.notify(
@@ -726,7 +758,6 @@ class AppController:
         self._close_logger()
         logger = LogFile()
         self.logger = logger
-        self.job = cfg
 
         info = f"共找到 {len(files)} 个文件"
         if excluded_dirs:
@@ -759,6 +790,7 @@ class AppController:
                 return
             self.pending_close = True
             self.on_stop()
+            self.window.set_status("已请求停止，等待当前文件结束后退出…")
             return
         self._shutdown()
         self.window.destroy()
