@@ -14,13 +14,19 @@ from __future__ import annotations
 import configparser
 import os
 import re
+import sys
 import tkinter as tk
 import tkinter.font as tkfont
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import List
 
-APP_DIR = Path(__file__).resolve().parent
+# PyInstaller 打包（frozen）后以 exe 所在目录为基准，源码运行时以本文件目录为基准
+APP_DIR = (
+    Path(sys.executable).resolve().parent
+    if getattr(sys, "frozen", False)
+    else Path(__file__).resolve().parent
+)
 # 首次运行（没有 settings.ini）时使用随程序分发的 astyle 与风格配置
 DEFAULT_EXE = str(APP_DIR / "astyle" / "astyle.exe")
 DEFAULT_RC = str(APP_DIR / ".astylerc")

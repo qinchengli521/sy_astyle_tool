@@ -1,0 +1,10 @@
+# Astyle 批量风格化工具（sy_astyle_tool）依赖清单
+#
+# 运行时依赖：本项目只使用 Python 标准库
+#   （tkinter / subprocess / threading / queue / configparser / hashlib 等），
+#   无任何第三方运行时依赖，直接 `python main.py` 即可运行。
+#
+# 以下为开发/打包阶段的工具依赖（非运行必需），安装：
+#   pip install -r requirements.txt
+
+pyinstaller==6.22.3
