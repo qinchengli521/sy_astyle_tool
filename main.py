@@ -425,8 +425,18 @@ class AppController:
         w.btn_stop.configure(command=self.on_stop)
         w.btn_clean_orig.configure(command=self.on_clean_orig)
 
+        # 手动输入/粘贴代码目录后，失焦即加载该目录的选项
+        w.dir_edit.bind("<FocusOut>", self.on_code_dir_focus_out, add="+")
+
         # 关窗按钮
         w.protocol("WM_DELETE_WINDOW", self.on_close_requested)
+
+    # -------- 代码目录切换（选项按目录加载/保存）
+    def on_code_dir_focus_out(self, _event=None):
+        """代码目录输入框失焦：若目录变了，保存旧目录并套用该目录的选项。"""
+        root = self.window.code_dir().strip()
+        if root and self.window.switch_options_to(root):
+            self.window.set_status(f"已加载代码目录选项：{root}")
 
     # -------- 浏览按钮
     def on_pick_exe(self):
@@ -494,8 +504,9 @@ class AppController:
     def on_pick_code_dir(self):
         path = self.window.pick_code_dir()
         if path:
+            self.window.switch_options_to(path)   # 保存旧目录 + 加载新目录选项
             self.remember_dir(path)
-            self.window.set_status(f"已选择代码目录：{path}")
+            self.window.set_status(f"已选择代码目录：{path}（已加载该目录选项）")
 
     def on_add_exclude(self):
         path = self.window.pick_exclude_dir()
@@ -570,13 +581,17 @@ class AppController:
             self.history_menu.grab_release()
 
     def on_history_chosen(self, path: str):
+        self.window.switch_options_to(path)   # 保存旧目录 + 加载目标目录选项
         self.window.set_code_dir(path)
         self.remember_dir(path)
-        self.window.set_status(f"已切换代码目录：{path}")
+        self.window.set_status(f"已切换代码目录：{path}（已加载该目录选项）")
 
     def on_clear_history(self):
-        self.save_history([])
-        self.window.set_status("已清除历史目录")
+        # 按约定：清除历史记录时连同所有目录选项配置一并删除
+        self.window.settings.clear_profiles()
+        self.save_history([])                # 内部 sync，一次写盘
+        self.window.apply_options(None)      # 界面回到全局默认值
+        self.window.set_status("已清除历史目录及各目录的选项配置")
 
     # -------- 日志同时进界面和文件
     def _log(self, line: str, level: str = "INFO"):
@@ -719,6 +734,9 @@ class AppController:
             return
 
         cfg = self.window.get_config()
+        if self.window.switch_options_to(cfg["root"]):
+            cfg = self.window.get_config()   # 目录变化后选项已按该目录重新加载
+        self.window.save_current_options()   # 运行前固化当前目录的选项
         self.remember_dir(cfg["root"])
 
         error = validate_config(cfg)

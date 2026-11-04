@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import configparser
+import hashlib
 import os
 import re
 import sys
@@ -19,7 +20,7 @@ import tkinter as tk
 import tkinter.font as tkfont
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
-from typing import List
+from typing import List, Optional
 
 # PyInstaller 打包（frozen）后以 exe 所在目录为基准，源码运行时以本文件目录为基准
 APP_DIR = (
@@ -44,7 +45,18 @@ HINT_COLOR = "#8a8f98"
 ALL_EXTS = [".c", ".h", ".cpp", ".hpp"]
 DEFAULT_EXTS = [".c", ".h"]
 
-WINDOW_TITLE = "思远Astyle代码风格化工具 V0.1"
+# 每个代码目录一份的选项默认值（新目录首次使用时套用）
+DEFAULT_RECURSIVE = True
+DEFAULT_BACKUP = False
+DEFAULT_DRY_RUN = False
+DEFAULT_EXCLUDES = ".git"
+
+# settings.ini 中按目录保存选项的段名前缀与键集合
+PROFILE_PREFIX = "Dir_"
+PROFILE_KEYS = ("recursive", "backup", "dry_run", "exts", "excludes")
+LEGACY_OPTION_KEYS = ("recursive", "backup", "dry_run", "exts", "excludes")
+
+WINDOW_TITLE = "思远Astyle代码风格化工具 V0.2"
 WINDOW_GEOMETRY = "610x620"
 MIN_WIDTH, MIN_HEIGHT = 610, 620
 
@@ -61,11 +73,20 @@ MAX_LOG_LINES = 5000   # 界面日志区最大行数，超出后从头部批量�
 LOG_TRIM_CHUNK = 500   # 每次裁剪的行数，避免逐行频繁删除
 
 
+def parse_bool(raw: str, default: bool) -> bool:
+    """ini 里的布尔字符串 → bool；空值取默认。"""
+    text = (raw or "").strip().lower()
+    if not text:
+        return default
+    return text in ("1", "true", "yes", "on")
+
+
 class Settings:
     """settings.ini 读写（configparser，无插值）。
 
-    键名与旧版 QSettings 版本保持一致：exe/rc/root/recursive/backup/dry_run/
-    exts/excludes/history/geometry。[General] 段。
+    [General] 段只存全局项：exe / rc / root / history / geometry
+    （exe、rc 为所有代码目录共用；root 是上次目录；history 为历史列表）。
+    每个代码目录的选项单独存在 [Dir_<路径哈希>] 段中，见 get_profile/set_profile。
     """
 
     SECTION = "General"
@@ -81,8 +102,8 @@ class Settings:
         if not self.parser.has_section(self.SECTION):
             self.parser.add_section(self.SECTION)
 
-    def get(self, key: str, default: str = "") -> str:
-        raw = self.parser.get(self.SECTION, key, fallback=None)
+    def get(self, key: str, default: str = "", section: Optional[str] = None) -> str:
+        raw = self.parser.get(section or self.SECTION, key, fallback=None)
         if raw is None:
             return default
         raw = raw.strip()
@@ -91,16 +112,13 @@ class Settings:
             raw = raw[1:-1]
         return raw
 
-    def get_path(self, key: str, default: str = "") -> str:
+    def get_path(self, key: str, default: str = "", section: Optional[str] = None) -> str:
         """路径类取值：额外还原旧 QSettings 的双写反斜杠（D:\\\\astyle → D:\\astyle）。"""
-        raw = self.get(key, default)
+        raw = self.get(key, default, section)
         return raw.replace("\\\\", "\\") if "\\\\" in raw else raw
 
-    def get_bool(self, key: str, default: bool) -> bool:
-        raw = self.get(key, "").strip().lower()
-        if not raw:
-            return default
-        return raw in ("1", "true", "yes", "on")
+    def get_bool(self, key: str, default: bool, section: Optional[str] = None) -> bool:
+        return parse_bool(self.get(key, "", section), default)
 
     def set(self, key: str, value) -> None:
         if isinstance(value, bool):
@@ -113,6 +131,45 @@ class Settings:
                 self.parser.write(fh, space_around_delimiters=True)
         except OSError:
             pass
+
+    # -------------------------------------------- 按代码目录保存的选项配置
+    @staticmethod
+    def profile_section(root: str) -> str:
+        """目录 → 段名：用规范化绝对路径的哈希，避免路径中的特殊字符影响 ini 解析。"""
+        key = os.path.normcase(os.path.normpath(os.path.abspath(root)))
+        return PROFILE_PREFIX + hashlib.sha256(key.encode("utf-8")).hexdigest()[:12]
+
+    def get_profile(self, root: str) -> Optional[dict]:
+        """返回该目录的 5 个选项（原始字符串）；没有保存过则返回 None。"""
+        if not (root or "").strip():
+            return None
+        section = self.profile_section(root)
+        if not self.parser.has_section(section):
+            return None
+        return {key: self.get(key, section=section) for key in PROFILE_KEYS}
+
+    def set_profile(self, root: str, values: dict) -> None:
+        """写入/更新某目录的选项段；调用方负责 sync()。"""
+        if not (root or "").strip():
+            return
+        section = self.profile_section(root)
+        if not self.parser.has_section(section):
+            self.parser.add_section(section)
+        # path 键仅供人工查看，程序按段名（哈希）查找
+        self.parser.set(section, "path", os.path.normpath(os.path.abspath(root)))
+        for key in PROFILE_KEYS:
+            self.parser.set(section, key, str(values.get(key, "")))
+
+    def clear_profiles(self) -> None:
+        """删除全部目录选项段（清除历史记录时一并调用）；调用方负责 sync()。"""
+        for section in list(self.parser.sections()):
+            if section.startswith(PROFILE_PREFIX):
+                self.parser.remove_section(section)
+
+    def drop_legacy_option_keys(self) -> None:
+        """清理旧版写在 [General] 里的全局选项键（按约定不迁移、直接忽略）。"""
+        for key in LEGACY_OPTION_KEYS:
+            self.parser.remove_option(self.SECTION, key)
 
 
 def read_text_any(path: Path) -> str:
@@ -175,6 +232,7 @@ class MainWindow(tk.Tk):
         super().__init__()
         self.settings = Settings(SETTINGS_FILE)
         self._running = False
+        self._options_root = ""   # 当前界面选项归属的（规范化）代码目录
 
         self.title(WINDOW_TITLE)
         self.geometry(WINDOW_GEOMETRY)
@@ -381,6 +439,68 @@ class MainWindow(tk.Tk):
             ],
         }
 
+    # ------------------------------------- 界面原语：按代码目录的选项配置
+    @staticmethod
+    def _norm_root(root: str) -> str:
+        text = (root or "").strip().strip('"')
+        if not text:
+            return ""
+        return os.path.normcase(os.path.normpath(os.path.abspath(text)))
+
+    def get_options(self) -> dict:
+        """采集"选项"分组的 5 项，值统一为可写入 ini 的形式。"""
+        cfg = self.get_config()
+        return {
+            "recursive": cfg["recursive"],
+            "backup": cfg["backup"],
+            "dry_run": cfg["dry_run"],
+            "exts": ",".join(cfg["extensions"]),
+            "excludes": ";".join(cfg["excludes"]),
+        }
+
+    def apply_options(self, profile: Optional[dict]):
+        """把某目录的选项应用到界面；None（新目录）或缺键时用全局默认值。"""
+        raw = profile or {}
+        self.recursive_var.set(parse_bool(raw.get("recursive"), DEFAULT_RECURSIVE))
+        self.backup_var.set(parse_bool(raw.get("backup"), DEFAULT_BACKUP))
+        self.dryrun_var.set(parse_bool(raw.get("dry_run"), DEFAULT_DRY_RUN))
+        exts_raw = raw.get("exts", "")
+        chosen = (
+            {e.strip() for e in exts_raw.split(",") if e.strip()}
+            if exts_raw
+            else set(DEFAULT_EXTS)
+        )
+        for ext, var in self.ext_vars.items():
+            var.set(ext in chosen)
+        self.exclude_edit.set_text(raw.get("excludes") or DEFAULT_EXCLUDES)
+
+    def load_options_for(self, root: str):
+        """加载指定目录的选项（新目录用默认值），并记录界面选项的归属目录。"""
+        self.apply_options(self.settings.get_profile(root))
+        self._options_root = self._norm_root(root)
+
+    def save_options_for(self, root: str):
+        """把当前界面的选项保存到指定代码目录（目录为空则跳过）。"""
+        if not self._norm_root(root):
+            return
+        self.settings.set_profile(root, self.get_options())
+        self.settings.sync()
+
+    def save_current_options(self):
+        """把当前界面的选项保存到当前代码目录。"""
+        self.save_options_for(self.code_dir())
+
+    def switch_options_to(self, root: str) -> bool:
+        """切换到指定目录：先保存当前目录的选项，再加载该目录的选项（新目录用默认值）。
+        返回是否发生了切换。"""
+        key = self._norm_root(root)
+        if key == self._options_root:
+            return False
+        if self._options_root:
+            self.save_options_for(self._options_root)
+        self.load_options_for(root)
+        return True
+
     # ------------------------------------------------- 界面原语：选择文件/目录
     def pick_exe(self) -> str:
         return self._pick_file(
@@ -500,35 +620,26 @@ class MainWindow(tk.Tk):
         except OSError as exc:
             self.notify("打开日志目录", f"无法打开：\n{exc}", "warning")
 
-    # -------------------------------------------------------------- 持久化
+    # -------------------------------------------------------------- 设置保存
     def save_settings(self):
         s = self.settings
+        # 全局项：exe / rc 所有代码目录共用，root / geometry 为程序级状态
         s.set("exe", self.exe_edit.get_text())
         s.set("rc", self.rc_edit.get_text())
         s.set("root", self.dir_edit.get_text())
-        s.set("recursive", self.recursive_var.get())
-        s.set("backup", self.backup_var.get())
-        s.set("dry_run", self.dryrun_var.get())
-        s.set("exts", ",".join(e for e, var in self.ext_vars.items() if var.get()))
-        s.set("excludes", self.exclude_edit.get_text())
         s.set("geometry", self.winfo_geometry())
-        s.sync()
+        s.drop_legacy_option_keys()
+        # 选项按代码目录单独保存（save_current_options 内部统一 sync）
+        self.save_current_options()
 
     def load_settings(self):
         s = self.settings
         self.exe_edit.set_text(s.get_path("exe", DEFAULT_EXE))
         self.rc_edit.set_text(s.get_path("rc", DEFAULT_RC))
-        self.dir_edit.set_text(s.get_path("root", ""))
-        self.recursive_var.set(s.get_bool("recursive", True))
-        self.backup_var.set(s.get_bool("backup", False))
-        self.dryrun_var.set(s.get_bool("dry_run", False))
-
-        exts = s.get("exts", ",".join(DEFAULT_EXTS))
-        chosen = {e.strip() for e in exts.split(",") if e.strip()}
-        for ext, var in self.ext_vars.items():
-            var.set(ext in chosen)
-
-        self.exclude_edit.set_text(s.get_path("excludes", ".git"))
+        root = s.get_path("root", "")
+        self.dir_edit.set_text(root)
+        # 选项按上次的代码目录加载；没有该目录配置时用全局默认值
+        self.load_options_for(root)
 
         geometry = s.get("geometry", "")
         match = GEOMETRY_RE.match(geometry)

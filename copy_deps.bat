@@ -3,15 +3,15 @@ chcp 65001 >nul
 rem ============================================================
 rem 复制运行依赖到打包输出目录
 rem 从代码仓库根目录复制 .astylerc 与 astyle\astyle.exe
-rem 到 dist\AstyleTool\（PyInstaller 目录模式产物）。
+rem 到 dist\sy_astyle_tool\（PyInstaller 目录模式产物）。
 rem 用法：先按 docs\打包说明.md 打包，再双击或命令行运行本脚本。
 rem ============================================================
 setlocal
 
-set "DIST=%~dp0dist\AstyleTool"
+set "DIST=%~dp0dist\sy_astyle_tool"
 
-if not exist "%DIST%\AstyleTool.exe" (
-    echo [错误] 未找到 "%DIST%\AstyleTool.exe"
+if not exist "%DIST%\sy_astyle_tool.exe" (
+    echo [错误] 未找到 "%DIST%\sy_astyle_tool.exe"
     echo 请先按 docs\打包说明.md 第 2 节执行 PyInstaller 打包。
     exit /b 1
 )
